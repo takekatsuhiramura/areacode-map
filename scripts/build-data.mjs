@@ -6,6 +6,7 @@
 // Sources:
 //   data/source/soumu-*.txt                 pdftotext -layout output of the MIC (総務省) area code list PDF
 //   data/source/libphonenumber-ja-81.txt    libphonenumber geocoding data (ja), used for MA names / exchange hints
+//   data/source/ntt-ma-names.json          official NTT East/West MA names, preferred when naming areas
 //   data/source/municipalities-s0010.topo.json  Municipality boundaries (MLIT N03 via smartnews-smri/japan-topography)
 import { readFileSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -19,6 +20,7 @@ mkdirSync(outDir, { recursive: true })
 const soumuFile = readdirSync(srcDir).find((f) => f.startsWith('soumu-'))
 const soumuLines = readFileSync(join(srcDir, soumuFile), 'utf8').split('\n')
 const topo = JSON.parse(readFileSync(join(srcDir, 'municipalities-s0010.topo.json'), 'utf8'))
+const nttNames = JSON.parse(readFileSync(join(srcDir, 'ntt-ma-names.json'), 'utf8'))
 const libLines = readFileSync(join(srcDir, 'libphonenumber-ja-81.txt'), 'utf8').split('\n')
 
 const norm = (s) =>
@@ -194,9 +196,14 @@ const lib = libLines
   })
 
 const stripSuffix = (n) => n.replace(/[市町村区郡]$/, '')
+// Drop a leading 郡 name only for towns/villages (so 郡山市, 郡上市, 蒲郡市 stay intact)
+const stripGun = (n) => n.replace(/^.*郡(?=.*[町村]$)/, '')
+const areaCodes = [...new Set(areas.map((a) => a.areaCode))]
+// Longest area code wins, so 880x numbers don't count toward area code 88
+const ownerCode = (prefix) => areaCodes.filter((c) => prefix.startsWith(c)).sort((x, y) => y.length - x.length)[0]
 const matchesName = (area, libName) =>
   area.munis.some((m) => {
-    const bare = stripSuffix(norm(m.name.replace(/^.*郡/, '')))
+    const bare = stripSuffix(norm(stripGun(m.name)))
     return bare.length >= 2 && (libName.includes(bare) || (libName.length >= 2 && bare.includes(libName)))
   })
 
@@ -206,11 +213,14 @@ for (const a of areas) {
   groups.get(a.areaCode).push(a)
 }
 
-const bareName = (m) => stripSuffix(norm(m.name.replace(/^.*郡/, '')))
+// MA names that cannot be derived from municipality / libphonenumber names
+const nameOverrides = { 54: '十勝池田', 623: '三重', 627: '国東' }
+
+const bareName = (m) => stripSuffix(norm(stripGun(m.name)))
 for (const group of groups.values()) {
   const taken = new Set()
   for (const a of group) {
-    const own = lib.filter((l) => l.prefix.startsWith(a.areaCode))
+    const own = lib.filter((l) => ownerCode(l.prefix) === a.areaCode)
     const scored = a.munis.map((m) => {
       const bare = bareName(m)
       const hits = own.filter((l) => bare.length >= 2 && (l.name.includes(bare) || (l.name.length >= 2 && bare.includes(l.name))))
@@ -218,12 +228,20 @@ for (const group of groups.values()) {
     })
     scored.sort((x, y) => Math.min(kindRank[y.m.kind], 1) - Math.min(kindRank[x.m.kind], 1) || y.count - x.count)
     const candidates = []
+    const strong = []
     for (const { m, hit } of scored) {
-      if (hit) candidates.push(hit.name)
-      candidates.push(stripSuffix(m.name.replace(/^.*郡/, '')))
+      const names = [...(hit ? [hit.name] : []), stripSuffix(stripGun(m.name))]
+      candidates.push(...names)
+      if (m.kind !== 'part') strong.push(...names)
     }
     if (a.description.startsWith('東京都23区')) candidates.unshift('東京23区')
-    const pick = candidates.find((c) => !taken.has(c))
+    if (nameOverrides[a.id]) candidates.unshift(nameOverrides[a.id])
+    const official = new Set([
+      ...(nttNames.east[a.areaCode] ?? []),
+      ...a.munis.flatMap((m) => nttNames.west[m.pref] ?? []),
+    ])
+    // Prefer an official NTT name, but only one derived from a (mostly) fully covered municipality
+    const pick = strong.find((c) => !taken.has(c) && official.has(c)) ?? candidates.find((c) => !taken.has(c))
     a.name = pick ?? `${candidates[0] ?? a.id}(${a.id})`
     taken.add(a.name)
   }
@@ -233,7 +251,7 @@ for (const [code, group] of groups) {
   if (group.length < 2) continue
   for (const a of group) a.exchanges = []
   for (const l of lib) {
-    if (!l.prefix.startsWith(code) || l.prefix.length <= code.length) continue
+    if (ownerCode(l.prefix) !== code || l.prefix.length <= code.length) continue
     const hits = group.filter((a) => matchesName(a, l.name))
     if (hits.length === 1) hits[0].exchanges.push(l.prefix)
   }
@@ -295,16 +313,15 @@ console.log(`areas with no municipalities: ${empty.length}`, empty.map((a) => a.
 
 // ---------- write ----------
 areas.sort((a, b) => a.areaCode.localeCompare(b.areaCode) || parseInt(a.id) - parseInt(b.id))
-const areasOut = {
-  meta: {
-    title: '固定電話 市外局番・番号区画(MA)データ',
-    updated: soumuLines.join('\n').match(/（(令和.+?)現在）/)?.[1] ?? '',
-    boundaries: '国土数値情報 行政区域データ N03-21 (2021-01-01)',
-    generatedBy: 'scripts/build-data.mjs',
-  },
-  areas,
+const areasMeta = {
+  title: '固定電話 市外局番・番号区画(MA)データ',
+  updated: soumuLines.join('\n').match(/（(令和.+?)現在）/)?.[1] ?? '',
+  boundaries: '国土数値情報 行政区域データ N03-21 (2021-01-01)',
+  generatedBy: 'scripts/build-data.mjs',
 }
-writeFileSync(join(outDir, 'areas.json'), JSON.stringify(areasOut))
+// One area per line keeps the file diff-friendly without bloating it
+const areasJson = `{\n"meta": ${JSON.stringify(areasMeta)},\n"areas": [\n${areas.map((a) => JSON.stringify(a)).join(',\n')}\n]\n}\n`
+writeFileSync(join(outDir, 'areas.json'), areasJson)
 
 const outTopo = {
   ...topo,
